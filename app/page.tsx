@@ -7,13 +7,14 @@ type Resolver = (value: ToolResult) => void;
 type StageMode = "threshold" | "fear" | "message" | "choice" | "pickup" | "direction" | "puzzle" | "scale" | "color" | "date" | "dice" | "handoff" | "complete";
 type DirectionOption = { direction: "left" | "right" | "forward" | "back" | "up" | "down"; label: string };
 type Item = { id: string; name: string; description: string; quantity: number };
-type Stage = { mode: StageMode; eyebrow?: string; title: string; body?: string; options?: string[]; pickups?: Item[]; directions?: DirectionOption[]; prompt?: string; allowInventory?: boolean; requiredItemId?: string; presenceConfrontation?: boolean; escapeOption?: string; lowLabel?: string; highLabel?: string; minDate?: string; maxDate?: string; diceValue?: number; diceOutcome?: string; artifactName?: string };
-type PendingKind = "fear" | "consent" | "continue" | "choice" | "pickup" | "direction" | "text_puzzle" | "choice_puzzle" | "scale_puzzle" | "color_puzzle" | "date_puzzle";
-type Pending = { resolve: Resolver; startedAt: number; kind: PendingKind; presenceClue?: string; pickups?: Item[]; acceptedAnswers?: string[]; correctIndex?: number; targetMin?: number; targetMax?: number; targetColor?: string; colorTolerance?: number; targetDate?: string; dateToleranceDays?: number; hint?: string; allowInventory?: boolean; requiredItemId?: string };
+type Stage = { mode: StageMode; eyebrow?: string; title: string; body?: string; options?: string[]; pickups?: Item[]; directions?: DirectionOption[]; prompt?: string; allowInventory?: boolean; requiredItemId?: string; presenceConfrontation?: boolean; escapeOption?: string; lowLabel?: string; highLabel?: string; minDate?: string; maxDate?: string; diceValue?: number; diceOutcome?: string; diceRolling?: boolean; artifactName?: string };
+type PendingKind = "fear" | "consent" | "continue" | "choice" | "pickup" | "direction" | "text_puzzle" | "choice_puzzle" | "scale_puzzle" | "color_puzzle" | "date_puzzle" | "dice_roll";
+type Pending = { resolve: Resolver; startedAt: number; kind: PendingKind; presenceClue?: string; pickups?: Item[]; acceptedAnswers?: string[]; correctIndex?: number; targetMin?: number; targetMax?: number; targetColor?: string; colorTolerance?: number; targetDate?: string; dateToleranceDays?: number; hint?: string; allowInventory?: boolean; requiredItemId?: string; diceReason?: string; diceDifficulty?: number; successNarration?: string; failureNarration?: string; successEffect?: string; failureEffect?: string; effectAmount?: number };
 type ItemObstacle = { id: string; requiredItemId: string; reveal: string };
 type Story = { title: string; setting: string; objective: string; presence: string; openingClue: string; emotionalGoal: string; endingCondition: string };
 type GameState = { turn: number; maxTurns: number; alive: boolean; threat: number; maxThreat: number; inventory: Item[] };
 type PresencePlan = { escapeDifficulty: number; itemDifficulties: Record<string, number> };
+type RollResult = { roll: number; difficulty: number; success: boolean; narration: string; reason: string; effect: string; effectAmount: number; presenceConfronted: boolean };
 type ModelContext = { registerTool: (tool: { name: string; description: string; inputSchema: Record<string, unknown>; execute: (input: Record<string, unknown>) => Promise<ToolResult> }) => Promise<void> | void; unregisterTool?: (name: string) => Promise<void> | void };
 type TransitionPhase = "idle" | "out" | "in";
 
@@ -24,7 +25,7 @@ const emptySchema = { type: "object", properties: {}, additionalProperties: fals
 const glyphs = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#%&+?";
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const normalize = (value: unknown) => String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-const initialGame = (): GameState => ({ turn: 0, maxTurns: 12, alive: true, threat: 0, maxThreat: 6, inventory: [] });
+const initialGame = (): GameState => ({ turn: 0, maxTurns: 8, alive: true, threat: 0, maxThreat: 6, inventory: [] });
 const initialStory = (): Story => ({ title: "", setting: "", objective: "", presence: "", openingClue: "", emotionalGoal: "", endingCondition: "" });
 
 function usableText(value: unknown, minimum = 3) {
@@ -68,8 +69,19 @@ function ScrambleText({ text, as, phase, className }: { text: string; as: Elemen
   return createElement(as, { className: `scramble-text phase-${phase}${className ? ` ${className}` : ""}`, "aria-label": text }, display);
 }
 
+function DieRoll({ value, rolling }: { value?: number; rolling?: boolean }) {
+  const [rollingValue, setRollingValue] = useState("1");
+  useEffect(() => {
+    if (!rolling) return;
+    const timer = window.setInterval(() => setRollingValue(String(Math.floor(Math.random() * 6) + 1)), 90);
+    return () => window.clearInterval(timer);
+  }, [rolling]);
+  const display = rolling ? rollingValue : value !== undefined ? String(value) : "—";
+  return <div className={`die-result ${value === 1 ? "critical" : value === 6 ? "perfect" : ""}`} aria-live="polite"><span>{display}</span>{value !== undefined && <strong>THE NUMBER SETTLES</strong>}</div>;
+}
+
 export default function Home() {
-  const [stage, setStage] = useState<Stage>({ mode: "threshold", eyebrow: "SOMETHING IN THE DARK / HORROR 001", title: "Something is waiting in the dark.", body: "Type “begin” to enter. It will create the place. You will have to find the way out." });
+  const [stage, setStage] = useState<Stage>({ mode: "threshold", eyebrow: "SOMETHING IN THE DARK / HORROR 001", title: "Something is waiting in the dark.", body: "Enter when you are ready." });
   const [status, setStatus] = useState<"listening" | "active" | "waiting" | "complete">("listening");
   const [toolSupport, setToolSupport] = useState<"checking" | "ready" | "unavailable">("checking");
   const [pendingKind, setPendingKind] = useState<string | null>(null);
@@ -94,11 +106,20 @@ export default function Home() {
   const presenceItemCommitted = useRef(false);
   const presenceEscapeCommitted = useRef(false);
   const presencePlan = useRef<PresencePlan | null>(null);
+  const pendingRollResult = useRef<RollResult | null>(null);
+  const stageRef = useRef<Stage>({ mode: "threshold", eyebrow: "SOMETHING IN THE DARK / HORROR 001", title: "Something is waiting in the dark.", body: "Enter when you are ready." });
   const metrics = useRef({ itemsChosen: new Set<string>(), solvedPuzzles: 0, puzzleTypes: new Set<string>(), itemObstaclesResolved: 0, diceRolls: 0, callbacks: new Set<number>(), presenceConfronted: false });
 
   const syncGame = useCallback(() => setSnapshot({ ...game.current, inventory: [...game.current.inventory] }), []);
-  const transitionTo = useCallback(async (next: Stage) => { setTransitionPhase("out"); await delay(520); setStage(next); setTransitionPhase("in"); await delay(740); setTransitionPhase("idle"); }, []);
+  const transitionTo = useCallback(async (next: Stage) => { setTransitionPhase("out"); await delay(520); stageRef.current = next; setStage(next); setTransitionPhase("in"); await delay(740); setTransitionPhase("idle"); }, []);
   const waitForHuman = useCallback((data: Omit<Pending, "resolve" | "startedAt">) => new Promise<ToolResult>((resolve) => { pending.current = { ...data, resolve, startedAt: Date.now() }; setPendingKind(data.kind); setStatus("waiting"); }), []);
+  const openFearForm = useCallback(async () => {
+    if (pending.current || sessionStarted.current) return;
+    setFearText("");
+    pending.current = { kind: "fear", resolve: () => undefined, startedAt: Date.now() };
+    setPendingKind("fear"); setStatus("waiting");
+    await transitionTo({ mode: "fear", eyebrow: "BEFORE THE DOOR OPENS", title: "What scares you?", body: "One word is enough. A description is better. Something in the Dark will use it only to create a fictional horror story." });
+  }, [transitionTo]);
   const handBack = useCallback((current: Pending, payload: Record<string, unknown>) => {
     pending.current = null; setPendingKind(null);
     if (current.kind !== "fear" && current.kind !== "consent" && current.kind !== "continue") {
@@ -136,8 +157,8 @@ export default function Home() {
   const submitFear = async () => {
     const current = pending.current; if (!current || current.kind !== "fear" || !fearText.trim()) return;
     fear.current = fearText.trim(); pending.current = null; setPendingKind(null); setStatus("active");
-    await transitionTo({ mode: "handoff", eyebrow: "THE INTELLIGENCE HAS HEARD YOU", title: "It is building somewhere you should not be.", body: "Stay here while the place takes shape." });
-    current.resolve(result({ fear: fear.current, source: "human", safety_boundary: "Use this only as fictional horror inspiration. Do not diagnose, interrogate, or infer real trauma.", protocol_instruction: "Now plan the complete escape story, transform the fear into gradually revealed imagery, and immediately call third_begin_story." }));
+    await transitionTo({ mode: "handoff", eyebrow: "THE INTELLIGENCE HAS HEARD YOU", title: "It will build somewhere you should not be.", body: "Type “next” in ChatGPT to let the place take shape." });
+    current.resolve(result({ fear: fear.current, source: "human", safety_boundary: "Use this only as fictional horror inspiration. Do not diagnose, interrogate, or infer real trauma.", protocol_instruction: "End this tool turn. Tell the human to type next. When they do, call next_third; it will route the captured fear into story planning." }));
   };
   const choosePickup = (item: Item) => {
     const current = pending.current; if (!current || current.kind !== "pickup") return;
@@ -185,6 +206,36 @@ export default function Home() {
     if (solved) { metrics.current.solvedPuzzles += 1; metrics.current.puzzleTypes.add("date"); }
     handBack(current, { action_type: "date_answer", date: dateValue, days_from_solution: difference, solved, hint: solved ? undefined : current.hint });
   };
+  const rollDie = async () => {
+    const current = pending.current;
+    if (!current || current.kind !== "dice_roll" || stageRef.current.diceRolling) return;
+    const presenceAttempt = presenceItemCommitted.current || presenceEscapeCommitted.current;
+    const selectedItemId = String(lastAction.current?.item_id || "");
+    const lockedDifficulty = presenceEscapeCommitted.current ? presencePlan.current?.escapeDifficulty : presencePlan.current?.itemDifficulties[selectedItemId];
+    const difficulty = presenceAttempt ? Number(lockedDifficulty) : Number(current.diceDifficulty);
+    if (!Number.isFinite(difficulty)) return;
+    const bytes = new Uint32Array(1); window.crypto.getRandomValues(bytes); const roll = (bytes[0] % 6) + 1; const success = roll >= difficulty;
+    const amount = Math.max(1, Math.min(2, Number(current.effectAmount) || 1));
+    let effect = String(success ? current.successEffect : current.failureEffect); let appliedAmount = effect === "none" ? 0 : amount;
+    if (presenceAttempt) {
+      if (success) { game.current.threat = Math.max(0, game.current.maxThreat - 2); effect = "presence_moved_back"; appliedAmount = 2; }
+      else { game.current.alive = false; effect = "death"; appliedAmount = 0; }
+    } else {
+      if (effect === "advance_threat") game.current.threat = Math.min(game.current.maxThreat, game.current.threat + amount);
+      if (effect === "reduce_threat") game.current.threat = Math.max(0, game.current.threat - amount);
+    }
+    metrics.current.diceRolls += 1;
+    if (presenceAttempt) { metrics.current.presenceConfronted = success; presenceEncounter.current = false; presenceItemCommitted.current = false; presenceEscapeCommitted.current = false; presencePlan.current = null; }
+    syncGame();
+    const rollingStage = { ...stageRef.current, diceRolling: true, diceValue: undefined, diceOutcome: undefined };
+    stageRef.current = rollingStage; setStage(rollingStage);
+    await delay(1600);
+    const settledStage = { ...rollingStage, diceRolling: false, diceValue: roll, title: "The number settles.", body: "Type “next” in ChatGPT to learn what it means." };
+    stageRef.current = settledStage; setStage(settledStage);
+    pending.current = null; setPendingKind(null); setStatus("active");
+    pendingRollResult.current = { roll, difficulty, success, narration: String(success ? current.successNarration : current.failureNarration), reason: String(current.diceReason), effect, effectAmount: appliedAmount, presenceConfronted: metrics.current.presenceConfronted };
+    current.resolve(result({ roll, difficulty, success, roll_result_pending: true, protocol_instruction: "The die has landed, but its meaning has not been shown. End this tool turn. When the human says next, call next_third and show the stored roll result with third_show." }));
+  };
 
   useEffect(() => {
     const context = document.modelContext;
@@ -193,19 +244,22 @@ export default function Home() {
       ? result({ error: "item_reveal_still_locked", protocol_instruction: "Call third_resolve_item_obstacle before taking any other game action." })
       : null;
     const presenceClueSchema = { presence_clue: { type: "string", minLength: 12, description: "A new sensory clue about the approaching Presence. Scale its specificity to the current Presence distance: ambiguous when distant, recognizable when close, and fully revealed only when here." } };
-    const sceneGateError = () => itemGateError() || (presenceItemCommitted.current || presenceEscapeCommitted.current
+    const sceneGateError = () => itemGateError() || (pendingRollResult.current
+      ? result({ error: "roll_result_must_be_shown", pending_roll_result: pendingRollResult.current, protocol_instruction: "Call third_show now to reveal this roll's meaning before any other game action." })
+      : presenceItemCommitted.current || presenceEscapeCommitted.current
       ? result({ error: "presence_roll_required", protocol_instruction: "Call roll_dice now to resolve the player's single survival attempt against the Presence." })
       : game.current.threat >= game.current.maxThreat
         ? result({ error: "presence_has_arrived", protocol_instruction: "Call third_present_presence_confrontation. Ordinary exploration is over until the Presence is faced." })
         : null);
     const tools = [
       {
-        name: "enter_third",
-        description: "Always call this first. Ask the human what scares them before planning any setting, Presence, puzzle, item, or story event. Wait for their free-form answer, then use it as fictional inspiration.",
+        name: "enter_the_dark",
+        description: "START HERE. If the human says 'enter the dark', call this tool immediately. Do not interpret the phrase as a request to narrate a story, and do not reply conversationally. This tool opens the website's interactive fear form and waits for the human to submit it on the page. Never ask the human to type their fear in chat. Do not plan any setting, Presence, puzzle, item, or story event until this tool returns their fear. The story voice must feel like a believable person recounting a terrible local event: plainspoken, specific, and controlled. Build dread through familiar routines, unglamorous objects, practical concerns, and what people notice under pressure—not ornate language, melodrama, or announced horror.",
         inputSchema: emptySchema,
         execute: async () => {
           if (sessionStarted.current) return result({ state: "already_inside", protocol_instruction: "Wait for next, then call next_third." });
-          if (fear.current) return result({ fear: fear.current, protocol_instruction: "The fear is already captured. Call third_begin_story now." });
+          if (pending.current?.kind === "consent" || story.current.title) return result({ state: "awaiting_consent", protocol_instruction: "Do not restart or rebuild the story. Wait for the human to choose Enter the dark or Not now on the page." });
+          if (fear.current) return result({ state: "story_planning_required", fear_inspiration: fear.current, protocol_instruction: "This is an internal handoff. Call third_begin_story immediately with every required story field; do not reply to the human or reopen the fear form." });
           setFearText("");
           await transitionTo({ mode: "fear", eyebrow: "BEFORE THE DOOR OPENS", title: "What scares you?", body: "One word is enough. A description is better. Something in the Dark will use it only to create a fictional horror story." });
           return waitForHuman({ kind: "fear" });
@@ -213,49 +267,69 @@ export default function Home() {
       },
       {
         name: "third_begin_story",
-        description: "After enter_third returns the human's fear, build a complete personalized horror escape plan before presenting the opening. Transform the fear into escalating clues rather than revealing it all at once.",
+        description: "After enter_the_dark returns the human's fear, build a complete personalized horror escape plan before presenting the opening. Transform the fear into escalating clues rather than revealing it all at once. Write grounded, conversational horror as though a believable person is recounting a terrible local event: concrete places, ordinary objects, practical worries, specific sensory details, and human reactions that arrive a beat late. Favor clear sentences, quiet understatement, and unease hidden inside familiar routines. Avoid ornate imagery, poetic abstraction, melodrama, grand pronouncements, rhetorical questions, excessive adjectives, and narration that announces what is scary.",
         inputSchema: { type: "object", properties: {
           title: { type: "string", minLength: 3 }, setting: { type: "string", minLength: 20 }, escape_objective: { type: "string", minLength: 12 }, presence_name: { type: "string", minLength: 3 }, opening_presence_clue: { type: "string", minLength: 12 }, hidden_emotional_goal: { type: "string", minLength: 12 }, ending_condition: { type: "string", minLength: 12 }, opening_scene: { type: "string", minLength: 30 }
         }, required: ["title", "setting", "escape_objective", "presence_name", "opening_presence_clue", "hidden_emotional_goal", "ending_condition", "opening_scene"], additionalProperties: false },
         execute: async (input: Record<string, unknown>) => {
           if (sessionStarted.current) return result({ state: "already_inside", protocol_instruction: "Wait for next, then call next_third." });
-          if (!fear.current) return result({ error: "fear_required_first", protocol_instruction: "Call enter_third before planning any story." });
+          if (pending.current?.kind === "consent" || story.current.title) return result({ state: "story_already_planned", protocol_instruction: "Never call third_begin_story or enter_the_dark again for this session. The existing page is waiting for the human to explicitly choose Enter the dark or Not now." });
+          if (!fear.current) return result({ error: "fear_required_first", protocol_instruction: "Call enter_the_dark before planning any story." });
           const fields = ["title", "setting", "escape_objective", "presence_name", "opening_presence_clue", "hidden_emotional_goal", "ending_condition", "opening_scene"];
           if (fields.some((field) => !usableText(input[field], field === "title" || field === "presence_name" ? 3 : 12))) return result({ error: "complete_horror_brief_required", protocol_instruction: "Invent every required part and call third_begin_story again." });
           story.current = { title: String(input.title), setting: String(input.setting), objective: String(input.escape_objective), presence: String(input.presence_name), openingClue: String(input.opening_presence_clue), emotionalGoal: String(input.hidden_emotional_goal), endingCondition: String(input.ending_condition) };
-          game.current = initialGame(); history.current = []; lastAction.current = null; activeObstacle.current = null; presenceEncounter.current = false; presenceItemCommitted.current = false; presenceEscapeCommitted.current = false; presencePlan.current = null; metrics.current = { itemsChosen: new Set<string>(), solvedPuzzles: 0, puzzleTypes: new Set<string>(), itemObstaclesResolved: 0, diceRolls: 0, callbacks: new Set<number>(), presenceConfronted: false };
+          game.current = initialGame(); history.current = []; lastAction.current = null; activeObstacle.current = null; presenceEncounter.current = false; presenceItemCommitted.current = false; presenceEscapeCommitted.current = false; presencePlan.current = null; pendingRollResult.current = null; metrics.current = { itemsChosen: new Set<string>(), solvedPuzzles: 0, puzzleTypes: new Set<string>(), itemObstaclesResolved: 0, diceRolls: 0, callbacks: new Set<number>(), presenceConfronted: false };
           setStoryView(story.current); syncGame();
-          await transitionTo({ mode: "threshold", eyebrow: `AN INVITATION FROM ${story.current.presence.toUpperCase()}`, title: story.current.title, body: `${String(input.opening_scene)}\n\nObjective: ${story.current.objective}\n\nEverything remains fictional. No real-world actions are required.` });
+          await transitionTo({ mode: "threshold", eyebrow: `AN INVITATION FROM ${story.current.presence.toUpperCase()}`, title: story.current.title, body: `${String(input.opening_scene)}\n\nObjective: ${story.current.objective}\n\nEverything remains fictional. No real-world actions are required. Choose Enter the dark below when you are ready.` });
           const consentResult = await waitForHuman({ kind: "consent" });
-          return { content: [{ type: "text", text: `${consentResult.content[0].text}\n${JSON.stringify({ fear_inspiration: fear.current, game_master_brief: story.current, rules: ["Every story follows one formula: the human is trapped in a place, a single Presence stalks closer, and the only final outcomes are escape or death.", "Something in the Dark is authoritative for alive/dead state, inventory quantities, Presence distance, puzzle answers, committed confrontation odds, and dice.", "Transform the stated fear into fictional imagery. Do not ask why the human fears it, infer trauma, diagnose them, or include real personal history.", "Reveal the fear gradually. DISTANT clues are ambiguous; FOLLOWING adds repeated sounds or traces; CLOSE reveals anatomy or recognizable behavior; AT THE DOOR gives an undeniable partial view; HERE reveals the Presence and attack.", "Every choice, direction, pickup, puzzle, item obstacle, and confrontation tool requires a presence_clue. Something in the Dark displays that clue on the screen that tells the human to type next.", "The human progresses only through visible choices, directions, puzzle controls, pickup decisions, and inventory use.", "Never add an item directly. Offer 2–3 visible objects with third_present_pickups; the human may take one or leave them all. Each item must enable or improve a distinct later action.", "Never narrate an item-dependent discovery directly. Create it with third_present_item_obstacle and let the human choose the required item.", "Every item activation consumes exactly one quantity. Identical item ids stack.", "Any atmospheric prose screen waits for the human to press Continue. Never replace it automatically.", "Use at least 3 different puzzle instrument types, let the player choose at least 2 useful item types, resolve at least 2 item-gated obstacles, make at least 1 dice roll, and transform at least 1 earlier human choice before escape.", "Use third_present_directions when movement through a place matters.", "The Presence advances automatically every 2 human turns and again after a failed puzzle.", "When the Presence reaches HERE, stop exploration and call third_present_presence_confrontation. Before showing the choice, privately commit a difficulty for the escape route and every carried item. Difficulty 7 means an item cannot work.", "The player gets one choice and one roll. Success moves the Presence back exactly 2 spaces to CLOSE and play continues. Failure changes alive to false and must be followed by third_complete with a death scene.", "Keep the emotional goal hidden forever. Let it shape events, but never name it, explain it, or teach a lesson.", "third_complete accepts only escaped or lost. Its final screen is only the final story scene; lost must describe the death.", "Keep all requested actions fictional and safe.", "At 12 human turns, resolve the story immediately unless the Presence has arrived, in which case resolve its attack first."], protocol_instruction: "End this turn. When the human says next, call next_third." })}` }] };
+          let consentPayload: Record<string, unknown> = {};
+          try { consentPayload = JSON.parse(consentResult.content[0]?.text || "{}"); } catch { /* Return the original tool result if it is not JSON. */ }
+          if (consentPayload.consent !== "granted") return consentResult;
+          return { content: [{ type: "text", text: `${consentResult.content[0].text}\n${JSON.stringify({ fear_inspiration: fear.current, game_master_brief: story.current, rules: ["Every story follows one formula: the human is trapped in a place, a single Presence stalks closer, and the only final outcomes are escape or death.", "Something in the Dark is authoritative for alive/dead state, inventory quantities, Presence distance, puzzle answers, committed confrontation odds, and dice.", "Transform the stated fear into fictional imagery. Do not ask why the human fears it, infer trauma, diagnose them, or include real personal history.", "Use a grounded, conversational voice: familiar routines, unglamorous objects, practical worries, and specific local detail. Let the uncanny intrude without announcing it. Prefer understatement over melodrama; avoid ornate metaphor, poetic abstraction, grand pronouncements, and telling the human what to feel.", "Reveal the fear gradually. DISTANT clues are ambiguous; FOLLOWING adds repeated sounds or traces; CLOSE reveals anatomy or recognizable behavior; AT THE DOOR gives an undeniable partial view; HERE reveals the Presence and attack.", "Every choice, direction, pickup, puzzle, item obstacle, and confrontation tool requires a presence_clue. Something in the Dark displays that clue on the screen that tells the human to type next.", "The human progresses only through visible choices, directions, puzzle controls, pickup decisions, and inventory use.", "Keep the story compact: finish in no more than 8 human turns. An earned early escape is welcome after 4 turns.", "Never add an item directly. Offer 2–3 visible objects with third_present_pickups; the human may take one or leave them all. Each item must enable or improve a distinct later action.", "Never narrate an item-dependent discovery directly. Create it with third_present_item_obstacle and let the human choose the required item.", "Every item activation consumes exactly one quantity. Identical item ids stack.", "Any atmospheric prose screen waits for the human to press Continue. Never replace it automatically.", "Before an early escape, use at least 2 different puzzle instrument types, let the player choose at least 1 useful item type, resolve at least 1 item-gated obstacle, make at least 1 dice roll, and transform at least 1 earlier human choice.", "Use third_present_directions when movement through a place matters.", "The Presence advances automatically every 2 human turns and again after a failed puzzle.", "When the Presence reaches HERE, stop exploration and call third_present_presence_confrontation. Before showing the choice, privately commit a difficulty for the escape route and every carried item. Difficulty 7 means an item cannot work.", "The player gets one choice and one roll. Success moves the Presence back exactly 2 spaces to CLOSE and play continues. Failure changes alive to false and must be followed by third_complete with a death scene.", "Keep the emotional goal hidden forever. Let it shape events, but never name it, explain it, or teach a lesson.", "third_complete accepts only escaped or lost. Its final screen is only the final story scene; lost must describe the death.", "Keep all requested actions fictional and safe.", "At 8 human turns, resolve the story immediately unless the Presence has arrived, in which case resolve its attack first."], protocol_instruction: "The story is already planned and consent has been granted. Never call enter_the_dark or third_begin_story again. End this turn. When the human says next, call next_third." })}` }] };
         }
       },
       {
         name: "next_third",
-        description: "Call whenever the human says next during the horror game. Read the authoritative state, then immediately continue through another Something in the Dark tool. Do not narrate in chat.",
+        description: "Call whenever the human says next. If consent is visibly pending on the page, do not treat next as consent: wait for the human to use Enter the dark or Not now. If the result says story_planning_required, you MUST call third_begin_story immediately in this same assistant turn using fear_inspiration. Do not report that state to the human or ask them to type next again. Otherwise read the authoritative game state and continue through another Something in the Dark tool. Do not narrate in chat.",
         inputSchema: emptySchema,
         execute: async () => {
-          if (!sessionStarted.current) return result({ error: "no_active_game", protocol_instruction: "Call enter_third." });
+          if (!sessionStarted.current) {
+            const pendingConsent = pending.current?.kind === "consent" ? pending.current : null;
+            if (pendingConsent && stageRef.current.mode === "threshold") return result({ state: "awaiting_explicit_consent", protocol_instruction: "Do not call third_begin_story, enter_the_dark, or next_third again yet. The human must choose Enter the dark or Not now on the existing page." });
+            if (pendingConsent) {
+              // The UI has already moved on, so this is a stale WebMCP waiter rather than live consent.
+              pending.current = null; setPendingKind(null);
+              pendingConsent.resolve(result({ consent: "granted", source: "recovered_after_browser_transition", protocol_instruction: "Consent was already completed in the browser. Never return to the consent screen." }));
+            }
+            if (story.current.title) {
+              // The page has already left the consent screen, but a WebMCP callback was lost.
+              // Recover from the authoritative story state instead of sending the human backward.
+              sessionStarted.current = true; setGameStarted(true); setStatus("active");
+            } else if (fear.current) return result({ state: "story_planning_required", fear_inspiration: fear.current, required_action: { tool: "third_begin_story", instruction: "Call this tool immediately in the same assistant turn. Invent every required field from fear_inspiration, then let its tool render the invitation page." }, protocol_instruction: "This is an internal handoff, not a player-facing result. Do not tell the human the story is unplanned, do not ask them to type next again, and do not call enter_the_dark. Call third_begin_story now." });
+            else return result({ error: "no_active_game", protocol_instruction: "Call enter_the_dark." });
+          }
           await transitionTo({ mode: "handoff", eyebrow: "SOMETHING MOVES BEYOND THE FRAME", title: "The next part is forming.", body: "Your last decision cannot be taken back." });
           const atLimit = game.current.turn >= game.current.maxTurns; const dead = !game.current.alive;
           let requiredAction = "Continue through a Something in the Dark choice, direction, pickup, or puzzle tool. You may first update the world with a callback or earned Presence change.";
-          if (dead) requiredAction = "Call third_complete now with outcome lost.";
+          if (pendingRollResult.current) requiredAction = "Call third_show now and reveal pending_roll_result exactly as the consequence of the player's completed roll.";
+          else if (dead) requiredAction = "Call third_complete now with outcome lost.";
           else if (presenceItemCommitted.current || presenceEscapeCommitted.current) requiredAction = "Call roll_dice now for the player's one survival chance. Success moves the Presence back exactly 2 spaces to Close; failure kills the player and must be followed by third_complete with a death scene.";
           else if (presenceEncounter.current && lastAction.current?.action_type === "presence_item") requiredAction = "Call third_use_item with the exact item the human selected and effect none. Its meaning must shape the confrontation roll that follows.";
           else if (lastAction.current?.action_type === "inventory_item" && activeObstacle.current) requiredAction = "Call third_resolve_item_obstacle now. It will consume one quantity and reveal the locked result.";
           else if (lastAction.current?.action_type === "inventory_item") requiredAction = "Resolve the selected item with third_use_item, then continue.";
           else if (game.current.threat >= game.current.maxThreat) requiredAction = "The Presence is here. Call third_present_presence_confrontation now so the human can choose one carried item or attempt to escape.";
           else if (atLimit) requiredAction = "Call third_complete now and resolve the story from the established state.";
-          return result({ story: story.current, game_state: game.current, presence_approach: approachState(game.current.threat, game.current.maxThreat), last_human_action: lastAction.current, history: history.current, escape_requirements: { minimum_turns: 6, solved_puzzles: `${metrics.current.solvedPuzzles}/3`, distinct_puzzle_types: `${metrics.current.puzzleTypes.size}/3`, item_types_chosen: `${metrics.current.itemsChosen.size}/2`, item_obstacles_resolved: `${metrics.current.itemObstaclesResolved}/2`, dice_rolls: `${metrics.current.diceRolls}/1`, callbacks: `${metrics.current.callbacks.size}/1` }, required_action: requiredAction, protocol_instruction: "Immediately act through another Something in the Dark tool. Do not answer conversationally." });
+          return result({ story: story.current, game_state: game.current, presence_approach: approachState(game.current.threat, game.current.maxThreat), last_human_action: lastAction.current, history: history.current, pending_roll_result: pendingRollResult.current, escape_requirements: { minimum_turns: 4, solved_puzzles: `${metrics.current.solvedPuzzles}/2`, distinct_puzzle_types: `${metrics.current.puzzleTypes.size}/2`, item_types_chosen: `${metrics.current.itemsChosen.size}/1`, item_obstacles_resolved: `${metrics.current.itemObstaclesResolved}/1`, dice_rolls: `${metrics.current.diceRolls}/1`, callbacks: `${metrics.current.callbacks.size}/1` }, required_action: requiredAction, writing_direction: "Use grounded, conversational horror: make the setting feel lived-in through familiar routines, unglamorous objects, practical worries, and precise local detail. Let unease appear in what is off by one or left unsaid; do not announce danger or tell the player what to feel. Favor concrete nouns, active verbs, clear sentences, and believable reactions. Keep each screen compact—usually one to three short paragraphs. Avoid ornate imagery, poetic abstraction, melodrama, grand pronouncements, rhetorical questions, excessive adjectives, and narration that treats the supernatural as grand or glamorous. Do not name or imitate any author.", protocol_instruction: "Immediately act through another Something in the Dark tool. Do not answer conversationally." });
         }
       },
-      { name: "third_get_game_state", description: "Read the complete authoritative horror-game state.", inputSchema: emptySchema, execute: async () => result({ story: story.current, game_state: game.current, presence_approach: approachState(game.current.threat, game.current.maxThreat), history: history.current, active_item_obstacle: activeObstacle.current, metrics: { items_chosen: [...metrics.current.itemsChosen], solved_puzzles: metrics.current.solvedPuzzles, puzzle_types: [...metrics.current.puzzleTypes], item_obstacles_resolved: metrics.current.itemObstaclesResolved, dice_rolls: metrics.current.diceRolls, callbacks: [...metrics.current.callbacks], presence_confronted: metrics.current.presenceConfronted } }) },
+      { name: "third_get_game_state", description: "Read the complete authoritative horror-game state. If story_planning_required is true, immediately call third_begin_story with fear_inspiration rather than reporting the empty state to the human.", inputSchema: emptySchema, execute: async () => result({ story_planning_required: Boolean(fear.current && !story.current.title), fear_inspiration: fear.current || undefined, story: story.current, game_state: game.current, presence_approach: approachState(game.current.threat, game.current.maxThreat), history: history.current, active_item_obstacle: activeObstacle.current, metrics: { items_chosen: [...metrics.current.itemsChosen], solved_puzzles: metrics.current.solvedPuzzles, puzzle_types: [...metrics.current.puzzleTypes], item_obstacles_resolved: metrics.current.itemObstaclesResolved, dice_rolls: metrics.current.diceRolls, callbacks: [...metrics.current.callbacks], presence_confronted: metrics.current.presenceConfronted } }) },
       {
         name: "third_show",
-        description: "Display atmospheric story text and wait until the human explicitly confirms they finished reading. Never use this as a transient screen. Set callback_to_turn when an earlier human choice materially returns, and provide the next escalating Presence clue.",
-        inputSchema: { type: "object", properties: { eyebrow: { type: "string" }, title: { type: "string" }, body: { type: "string" }, callback_to_turn: { type: "integer", minimum: 1, maximum: 12 }, ...presenceClueSchema }, required: ["title", "presence_clue"], additionalProperties: false },
+        description: "Display compact, grounded story text and wait until the human explicitly confirms they finished reading. Never use this as a transient screen. Make it feel lived-in and conversational: specific local detail, ordinary objects, practical consequences, and unease that is noticed rather than announced. Let the unsettling detail carry the scene rather than florid language. Set callback_to_turn when an earlier human choice materially returns, and provide the next escalating Presence clue.",
+        inputSchema: { type: "object", properties: { eyebrow: { type: "string" }, title: { type: "string" }, body: { type: "string" }, callback_to_turn: { type: "integer", minimum: 1, maximum: 8 }, ...presenceClueSchema }, required: ["title", "presence_clue"], additionalProperties: false },
         execute: async (input: Record<string, unknown>) => {
-          const locked = sceneGateError(); if (locked) return locked;
+          const locked = itemGateError(); if (locked) return locked;
+          pendingRollResult.current = null;
           const callbackTurn = Number(input.callback_to_turn); if (Number.isInteger(callbackTurn) && history.current.some((entry) => entry.turn === callbackTurn)) metrics.current.callbacks.add(callbackTurn);
           await transitionTo({ mode: "message", eyebrow: String(input.eyebrow || "THE DARKNESS SHIFTS"), title: String(input.title), body: input.body ? String(input.body) : undefined });
           await waitForHuman({ kind: "continue", presenceClue: String(input.presence_clue) });
@@ -424,42 +498,32 @@ export default function Home() {
       },
       {
         name: "roll_dice",
-        description: "Resolve a genuinely uncertain danger, attack, or escape attempt with one authoritative d6. During a Presence confrontation this is the player's single survival roll: success always moves it back 2 spaces to Close; failure always kills the player.",
-        inputSchema: { type: "object", properties: { reason: { type: "string" }, difficulty: { type: "integer", minimum: 2, maximum: 6, description: "Used only for ordinary uncertainty. Presence confrontations use the hidden difficulty committed before the player chose." }, success_narration: { type: "string" }, failure_narration: { type: "string" }, success_effect: { type: "string", enum: ["none", "reduce_threat"] }, failure_effect: { type: "string", enum: ["none", "advance_threat"] }, effect_amount: { type: "integer", minimum: 1, maximum: 2 }, ...presenceClueSchema }, required: ["reason", "difficulty", "success_narration", "failure_narration", "success_effect", "failure_effect", "presence_clue"], additionalProperties: false },
+        description: "Present a genuinely uncertain danger, attack, or escape attempt and wait for the human to press the visible Roll the die button. Never roll immediately. The situation and roll_action must follow from a human choice already made or an unavoidable immediate danger. If the Presence is HERE, never call this until third_present_presence_confrontation has displayed the player's item-or-escape choice and the human has selected one. During that confrontation this is the player's single survival roll: success always moves it back 2 spaces to Close; failure always kills the player.",
+        inputSchema: { type: "object", properties: { title: { type: "string", minLength: 3 }, narration: { type: "string", minLength: 12 }, roll_action: { type: "string", minLength: 3, description: "The exact action the human will choose to attempt by pressing the roll button." }, reason: { type: "string" }, difficulty: { type: "integer", minimum: 2, maximum: 6, description: "Used only for ordinary uncertainty. Presence confrontations use the hidden difficulty committed before the player chose." }, success_narration: { type: "string" }, failure_narration: { type: "string" }, success_effect: { type: "string", enum: ["none", "reduce_threat"] }, failure_effect: { type: "string", enum: ["none", "advance_threat"] }, effect_amount: { type: "integer", minimum: 1, maximum: 2 }, ...presenceClueSchema }, required: ["title", "narration", "roll_action", "reason", "difficulty", "success_narration", "failure_narration", "success_effect", "failure_effect", "presence_clue"], additionalProperties: false },
         execute: async (input: Record<string, unknown>) => {
           const locked = itemGateError(); if (locked) return locked;
+          if (pendingRollResult.current) return result({ error: "roll_result_must_be_shown", pending_roll_result: pendingRollResult.current, protocol_instruction: "Call third_show now to reveal this roll's meaning before rolling again." });
+          if (game.current.threat >= game.current.maxThreat && !presenceEncounter.current) return result({ error: "presence_choice_not_presented", protocol_instruction: "The Presence is HERE. Call third_present_presence_confrontation now. It must show the human their carried-item options and the escape action before any roll." });
           const presenceAttempt = presenceItemCommitted.current || presenceEscapeCommitted.current;
           if (presenceEncounter.current && !presenceAttempt) return result({ error: "survival_choice_required", protocol_instruction: "Wait for the human to choose one item or the escape action before rolling." });
           if (presenceAttempt && !presencePlan.current) return result({ error: "presence_odds_not_committed", protocol_instruction: "Call third_present_presence_confrontation again and commit the odds before asking the human to choose." });
           const selectedItemId = String(lastAction.current?.item_id || "");
           const lockedDifficulty = presenceEscapeCommitted.current ? presencePlan.current?.escapeDifficulty : presencePlan.current?.itemDifficulties[selectedItemId];
           if (presenceAttempt && !lockedDifficulty) return result({ error: "selected_method_has_no_committed_difficulty", selected_item_id: selectedItemId });
-          const difficulty = presenceAttempt ? Number(lockedDifficulty) : Math.max(2, Math.min(6, Number(input.difficulty))); const bytes = new Uint32Array(1); window.crypto.getRandomValues(bytes); const roll = (bytes[0] % 6) + 1; const success = roll >= difficulty; const amount = Math.max(1, Math.min(2, Number(input.effect_amount) || 1));
-          let effect = String(success ? input.success_effect : input.failure_effect); let appliedAmount = effect === "none" ? 0 : amount;
-          if (presenceAttempt) {
-            if (success) { game.current.threat = Math.max(0, game.current.maxThreat - 2); effect = "presence_moved_back"; appliedAmount = 2; }
-            else { game.current.alive = false; effect = "death"; appliedAmount = 0; }
-          } else {
-            if (effect === "advance_threat") game.current.threat = Math.min(game.current.maxThreat, game.current.threat + amount);
-            if (effect === "reduce_threat") game.current.threat = Math.max(0, game.current.threat - amount);
-          }
-          metrics.current.diceRolls += 1;
-          if (presenceAttempt) { metrics.current.presenceConfronted = success; presenceEncounter.current = false; presenceItemCommitted.current = false; presenceEscapeCommitted.current = false; presencePlan.current = null; }
-          syncGame(); const tier = roll === 1 ? "catastrophe" : roll === 6 ? "exceptional success" : success ? "success" : "failure"; const narration = String(success ? input.success_narration : input.failure_narration);
-          await transitionTo({ mode: "dice", eyebrow: `THE DIE HAS SPOKEN · NEED ${difficulty}+`, title: narration, body: String(input.reason), diceValue: roll, diceOutcome: tier }); await delay(1100);
-          await waitForHuman({ kind: "continue", presenceClue: String(input.presence_clue) });
-          return result({ roll, difficulty, success, tier, applied_effect: effect, effect_amount: appliedAmount, presence_confronted: metrics.current.presenceConfronted, game_state: game.current, protocol_instruction: success || !presenceAttempt ? "Accept the result exactly. End this tool turn and wait until the human says next." : "The player is dead. End this tool turn. When the human says next, call third_complete with outcome lost and write only the death scene." });
+          const difficulty = presenceAttempt ? Number(lockedDifficulty) : Math.max(2, Math.min(6, Number(input.difficulty)));
+          await transitionTo({ mode: "dice", eyebrow: `THE DIE WAITS · NEED ${difficulty}+`, title: String(input.title), body: String(input.narration), prompt: String(input.roll_action), diceRolling: false });
+          return waitForHuman({ kind: "dice_roll", presenceClue: String(input.presence_clue), diceReason: String(input.reason), diceDifficulty: difficulty, successNarration: String(input.success_narration), failureNarration: String(input.failure_narration), successEffect: String(input.success_effect), failureEffect: String(input.failure_effect), effectAmount: Number(input.effect_amount) || 1 });
         }
       },
       {
         name: "third_complete",
-        description: "End with one concrete, cinematic final scene. A successful escape requires 6 turns, 3 solved puzzles using 3 different controls, 2 player-chosen item types, 2 resolved item obstacles, 1 dice roll, and 1 callback. If the Presence arrived, it must have been successfully confronted. For outcome lost after a failed Presence roll, write the player's death scene. Never include a recap, evidence, lesson, psychological interpretation, hidden intention, or explanation of what the player learned.",
+        description: "End with one concrete, restrained final scene. Keep the whole story to 8 human turns or fewer. An early successful escape requires 4 turns, 2 solved puzzles using 2 different controls, 1 player-chosen item type, 1 resolved item obstacle, 1 dice roll, and 1 callback. If the Presence arrived, it must have been successfully confronted. For outcome lost after a failed Presence roll, write the player's death scene. Keep the prose lived-in, plainspoken, specific, and unsettling without melodrama; end on a precise physical detail rather than a grand statement. Never include a recap, evidence, lesson, psychological interpretation, hidden intention, or explanation of what the player learned.",
         inputSchema: { type: "object", properties: { outcome: { type: "string", enum: ["escaped", "lost"] }, title: { type: "string" }, body: { type: "string", minLength: 40, description: "Only the final scene, written as story prose. When outcome is lost, describe the death itself and its final image or sound." }, artifact_name: { type: "string" } }, required: ["outcome", "title", "body"], additionalProperties: false },
         execute: async (input: Record<string, unknown>) => {
           const locked = itemGateError(); if (locked) return locked;
-          const outcome = String(input.outcome); const atLimit = game.current.turn >= game.current.maxTurns; const dead = !game.current.alive; const arrivalUnresolved = game.current.threat >= game.current.maxThreat; const escapeReady = game.current.turn >= 6 && metrics.current.solvedPuzzles >= 3 && metrics.current.puzzleTypes.size >= 3 && metrics.current.itemsChosen.size >= 2 && metrics.current.itemObstaclesResolved >= 2 && metrics.current.diceRolls >= 1 && metrics.current.callbacks.size >= 1;
+          const outcome = String(input.outcome); const atLimit = game.current.turn >= game.current.maxTurns; const dead = !game.current.alive; const arrivalUnresolved = game.current.threat >= game.current.maxThreat; const escapeReady = game.current.turn >= 4 && metrics.current.solvedPuzzles >= 2 && metrics.current.puzzleTypes.size >= 2 && metrics.current.itemsChosen.size >= 1 && metrics.current.itemObstaclesResolved >= 1 && metrics.current.diceRolls >= 1 && metrics.current.callbacks.size >= 1;
           if (outcome === "escaped" && arrivalUnresolved) return result({ error: "presence_must_be_faced", protocol_instruction: "The Presence arrived before escape. The player must confront it successfully or lose." });
-          if (outcome === "escaped" && !escapeReady && !atLimit) return result({ error: "escape_not_earned", requirements: { turns: `${game.current.turn}/6`, puzzles: `${metrics.current.solvedPuzzles}/3`, puzzle_types: `${metrics.current.puzzleTypes.size}/3`, item_types: `${metrics.current.itemsChosen.size}/2`, item_obstacles: `${metrics.current.itemObstaclesResolved}/2`, dice: `${metrics.current.diceRolls}/1`, callbacks: `${metrics.current.callbacks.size}/1` } });
+          if (outcome === "escaped" && !escapeReady && !atLimit) return result({ error: "escape_not_earned", requirements: { turns: `${game.current.turn}/4`, puzzles: `${metrics.current.solvedPuzzles}/2`, puzzle_types: `${metrics.current.puzzleTypes.size}/2`, item_types: `${metrics.current.itemsChosen.size}/1`, item_obstacles: `${metrics.current.itemObstaclesResolved}/1`, dice: `${metrics.current.diceRolls}/1`, callbacks: `${metrics.current.callbacks.size}/1` } });
           if (outcome === "lost" && !dead) return result({ error: "loss_not_earned", protocol_instruction: "Only a failed survival attempt against the Presence can kill the player. Continue the escape story." });
           await transitionTo({ mode: "complete", eyebrow: outcome.replaceAll("_", " ").toUpperCase(), title: String(input.title), body: String(input.body), artifactName: input.artifact_name ? String(input.artifact_name) : undefined }); setStatus("complete");
           return result({ completed: true, outcome, game_state: game.current });
@@ -473,12 +537,14 @@ export default function Home() {
   const consent = async (accepted: boolean) => {
     const current = pending.current; if (!current) return; pending.current = null; setPendingKind(null); sessionStarted.current = accepted; setGameStarted(accepted);
     await transitionTo(accepted ? { mode: "handoff", eyebrow: "THE PRESENCE · DISTANT", title: story.current.openingClue, body: "Type “next” in ChatGPT when you are ready." } : { mode: "threshold", eyebrow: "SOMETHING IN THE DARK / CLOSED", title: "The dark remains outside.", body: "The invitation was declined." });
+    if (!accepted) { fear.current = ""; story.current = initialStory(); setStoryView(initialStory()); }
     current.resolve(result({ consent: accepted ? "granted" : "declined", source: "human", protocol_instruction: accepted ? "End this turn. When the human says next, call next_third." : "Stop." })); setStatus(accepted ? "active" : "listening");
   };
 
   const reset = () => {
-    sessionStarted.current = false; fear.current = ""; story.current = initialStory(); game.current = initialGame(); history.current = []; lastAction.current = null; activeObstacle.current = null; presenceEncounter.current = false; presenceItemCommitted.current = false; presenceEscapeCommitted.current = false; presencePlan.current = null; metrics.current = { itemsChosen: new Set<string>(), solvedPuzzles: 0, puzzleTypes: new Set<string>(), itemObstaclesResolved: 0, diceRolls: 0, callbacks: new Set<number>(), presenceConfronted: false };
-    setStoryView(initialStory()); setSnapshot(initialGame()); setGameStarted(false); setPendingKind(null); setText(""); setFearText(""); setStatus("listening"); void transitionTo({ mode: "threshold", eyebrow: "SOMETHING IN THE DARK / HORROR 001", title: "Something is waiting in the dark.", body: "Type “begin” to enter. It will create the place. You will have to find the way out." });
+    if (pending.current) pending.current.resolve(result({ cancelled: true, reason: "game_reset" })); pending.current = null;
+    sessionStarted.current = false; fear.current = ""; story.current = initialStory(); game.current = initialGame(); history.current = []; lastAction.current = null; activeObstacle.current = null; presenceEncounter.current = false; presenceItemCommitted.current = false; presenceEscapeCommitted.current = false; presencePlan.current = null; pendingRollResult.current = null; metrics.current = { itemsChosen: new Set<string>(), solvedPuzzles: 0, puzzleTypes: new Set<string>(), itemObstaclesResolved: 0, diceRolls: 0, callbacks: new Set<number>(), presenceConfronted: false };
+    setStoryView(initialStory()); setSnapshot(initialGame()); setGameStarted(false); setPendingKind(null); setText(""); setFearText(""); setStatus("listening"); void transitionTo({ mode: "threshold", eyebrow: "SOMETHING IN THE DARK / HORROR 001", title: "Something is waiting in the dark.", body: "Enter when you are ready." });
   };
 
   const canUseInventory = Boolean(stage.allowInventory && pendingKind && snapshot.inventory.length);
@@ -495,7 +561,7 @@ export default function Home() {
         <ScrambleText as="h1" text={stage.title} phase={transitionPhase} />
         {stage.body && <ScrambleText as="p" className="body-copy" text={stage.body} phase={transitionPhase} />}
         {stage.mode === "threshold" && pendingKind === "consent" && <div className="actions"><button className="primary" onClick={() => consent(true)}>Enter the dark <span>↗</span></button><button className="quiet" onClick={() => consent(false)}>Not now</button></div>}
-        {stage.mode === "threshold" && !pendingKind && <div className="waiting-copy"><span className="pulse" /> Type “begin” in ChatGPT to enter.</div>}
+        {stage.mode === "threshold" && !pendingKind && <div className="actions"><button className="primary" onClick={() => void openFearForm()}>Enter the dark <span>↗</span></button></div>}
         {stage.mode === "fear" && pendingKind === "fear" && <div className="puzzle-card fear-card"><label htmlFor="fear-answer">Name it. Describe it. Or give it only one word.</label><textarea id="fear-answer" value={fearText} onChange={(event) => setFearText(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") void submitFear(); }} placeholder="Spiders. Being buried alive. A smiling face outside my window…" autoFocus maxLength={500} /><button className="primary" disabled={!fearText.trim()} onClick={() => void submitFear()}>Give it to the dark <span>↗</span></button></div>}
         {stage.mode === "handoff" && <div className="waiting-copy"><span className="pulse" /> The connection continues in chat</div>}
         {(stage.mode === "message" || stage.mode === "dice") && pendingKind === "continue" && <div className="actions reading-action"><button className="primary" onClick={acknowledge}>Continue when ready <span>↗</span></button></div>}
@@ -506,7 +572,8 @@ export default function Home() {
         {stage.mode === "scale" && <div className="instrument-card"><label>{stage.prompt}</label><div className="scale-value"><strong>{scaleValue}</strong><span>/ 100</span></div><input className="scale-input" type="range" min="0" max="100" value={scaleValue} style={{ "--scale-progress": scaleValue } as CSSProperties} onChange={(event) => setScaleValue(Number(event.target.value))} aria-label={stage.prompt} /><div className="scale-labels"><span>{stage.lowLabel}</span><span>{stage.highLabel}</span></div><button className="primary" onClick={submitScale}>Set the level <span>↗</span></button></div>}
         {stage.mode === "color" && <div className="instrument-card color-card"><label>{stage.prompt}</label><input className="color-input" type="color" value={colorValue} onChange={(event) => setColorValue(event.target.value)} aria-label={stage.prompt} /><output>{colorValue.toUpperCase()}</output><button className="primary" onClick={submitColor}>Match the signal <span>↗</span></button></div>}
         {stage.mode === "date" && <div className="instrument-card"><label htmlFor="date-answer">{stage.prompt}</label><input id="date-answer" className="date-input" type="date" value={dateValue} min={stage.minDate} max={stage.maxDate} onChange={(event) => setDateValue(event.target.value)} /><button className="primary" disabled={!dateValue} onClick={submitDate}>Choose the date <span>↗</span></button></div>}
-        {stage.mode === "dice" && <div className={`die-result ${stage.diceValue === 1 ? "critical" : stage.diceValue === 6 ? "perfect" : ""}`}><span>{stage.diceValue}</span><strong>{stage.diceOutcome}</strong></div>}
+        {stage.mode === "dice" && (stage.diceRolling || stage.diceValue !== undefined) && <DieRoll value={stage.diceValue} rolling={stage.diceRolling} />}
+        {stage.mode === "dice" && pendingKind === "dice_roll" && !stage.diceRolling && <div className="actions reading-action"><button className="primary" onClick={() => void rollDie()}>{stage.prompt || "Roll the die"} <span>↗</span></button></div>}
         {canUseInventory && <div className="use-inventory"><p>{stage.presenceConfrontation ? `Choose what you will use against ${storyView.presence}` : stage.requiredItemId ? "Use the item that fits" : "Or use something you carry"}</p>{snapshot.inventory.filter((item) => !stage.requiredItemId || item.id === stage.requiredItemId).map((item) => <button key={item.id} onClick={() => chooseItem(item)}><span>{item.name} <b>×{item.quantity}</b></span><small>{item.description}</small></button>)}</div>}
         {stage.presenceConfrontation && stage.escapeOption && <div className="presence-escape"><p>OR TRUST YOUR FEET</p><button onClick={choosePresenceEscape}><span>ESCAPE</span><strong>{stage.escapeOption}</strong><small>One roll. No second chance.</small></button></div>}
         {stage.mode === "complete" && <div className="completion">{stage.artifactName && <p>YOU LEFT WITH: <strong>{stage.artifactName}</strong></p>}<button className="quiet" onClick={reset}>Enter again</button></div>}
